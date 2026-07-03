@@ -259,19 +259,32 @@ def main():
                                 "tipo": tipo_val, "marca": marca_val, "anio": anio_val, "modelo": modelo_val, "motor": motor_val
                             })
 
-                            for tipo_filtro, ref, img in filtros_de_resultado(soup):
+                            resultados = filtros_de_resultado(soup)
+                            if not resultados:
+                                print(f"[-] Sin filtros: {marca_nom} {modelo_nom} {anio_nom} {motor_nom}")
+
+                            for tipo_filtro, ref, img in resultados:
+                                print(f"[+] Filtro encontrado: {marca_nom} {modelo_nom} {anio_nom} {motor_nom} -> {ref} ({tipo_filtro})")
+
                                 key = (tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref)
                                 if key not in filas_existentes:
                                     filas_existentes.add(key)
                                     w_veh.writerow([tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref, img])
-                                    print(f"[+] Match: {marca_nom} {modelo_nom} {anio_nom} {motor_nom} -> {ref}")
 
                                 if ref not in refs_detalladas:
                                     refs_detalladas.add(ref)
-                                    for fila in detalle(ses.s, "Aplicaciones", ref):
+                                    aplicaciones = detalle(ses.s, "Aplicaciones", ref)
+                                    equivalencias = detalle(ses.s, "Equivalencias", ref)
+                                    for fila in aplicaciones:
                                         w_apl.writerow([ref] + fila[:3])
-                                    for fila in detalle(ses.s, "Equivalencias", ref):
+                                    for fila in equivalencias:
                                         w_equ.writerow([ref] + fila[:2])
+                                    if aplicaciones or equivalencias:
+                                        print(f"    [i] Detalle extraído de {ref}: {len(aplicaciones)} aplicaciones, {len(equivalencias)} equivalencias")
+                                    else:
+                                        print(f"    [i] {ref}: sin datos de detalle, se pasó de largo")
+                                else:
+                                    print(f"    [i] {ref}: detalle ya extraído antes, se omite")
 
                         # Al finalizar por completo el modelo (un chunk lógico), guardamos progreso
                         processed_keys.add(chunk_key)
