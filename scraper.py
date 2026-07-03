@@ -29,6 +29,15 @@ PROGRESS_FILE = "scraping_progress.json"
 def sleep_jitter():
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
+def pedir_confirmacion(mensaje):
+    while True:
+        resp = input(mensaje).strip().lower()
+        if resp in ("y", "yes", "s", "si", "sí"):
+            return True
+        if resp in ("n", "no"):
+            return False
+        print("[!] Respuesta no válida, escribí Y o N.")
+
 def campos_ocultos(soup):
     def g(n):
         el = soup.find("input", {"name": n})
@@ -60,6 +69,7 @@ LEVELS = [
 class RateLimitedSession:
     def __init__(self):
         self.request_count = 0
+        self.pending_replay = False
         self._init_session()
 
     def _init_session(self):
@@ -117,13 +127,19 @@ class RateLimitedSession:
             self._post_raw(level_target, valores)
             sleep_jitter()
 
+    def should_checkpoint(self):
+        return self.request_count >= SESSION_RENEW_EVERY
+
+    def rotate_now(self):
+        self._init_session()
+        self.request_count = 0
+        self.pending_replay = True
+
     def post(self, target, valores):
         self.request_count += 1
-        if self.request_count >= SESSION_RENEW_EVERY:
-            print("\n[*] Rotating session to prevent session-based rate limits...")
-            self._init_session()
-            self.request_count = 0
+        if self.pending_replay:
             self._replay_context(target, valores)
+            self.pending_replay = False
 
         self._post_raw(target, valores)
         sleep_jitter()
@@ -168,6 +184,16 @@ def filtros_de_resultado(soup):
             out.append((t, r, i))
     return out
 
+def load_existing_veh_rows(path):
+    filas = set()
+    if os.path.exists(path):
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                filas.add(tuple(row[:7]))
+    return filas
+
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
@@ -184,18 +210,19 @@ def save_progress(processed_keys, refs_detalladas):
 
 def main():
     processed_keys, refs_detalladas = load_progress()
-    
+
     # Evaluar si los archivos ya existen para no escribir cabeceras de nuevo
     file_exists = os.path.exists("filtros_por_vehiculo.csv")
+    filas_existentes = load_existing_veh_rows("filtros_por_vehiculo.csv")
 
     f_veh = open("filtros_por_vehiculo.csv", "a", newline="", encoding="utf-8-sig")
     f_apl = open("aplicaciones.csv", "a", newline="", encoding="utf-8-sig")
     f_equ = open("equivalencias.csv", "a", newline="", encoding="utf-8-sig")
-    
+
     w_veh = csv.writer(f_veh)
     w_apl = csv.writer(f_apl)
     w_equ = csv.writer(f_equ)
-    
+
     if not file_exists:
         w_veh.writerow(["tipo_aplicacion","fabricante","anio","modelo","motor","tipo_filtro","referencia","url_imagen"])
         w_apl.writerow(["referencia","fabricante","modelo","cilindraje"])
@@ -203,55 +230,68 @@ def main():
 
     ses = RateLimitedSession()
 
-    for tipo_val, tipo_nom in TIPOS.items():
-        ses.post("ctl00$main$ddlTipoAplicacion", {"tipo": tipo_val})
-        marcas = opciones(ses.soup, "main_ddlMarca")
-        
-        for marca_val, marca_nom in marcas:
-            ses.post("ctl00$main$ddlMarca", {"tipo": tipo_val, "marca": marca_val})
-            anios = opciones(ses.soup, "main_ddlAnio")
-            
-            for anio_val, anio_nom in anios:
-                ses.post("ctl00$main$ddlAnio", {"tipo": tipo_val, "marca": marca_val, "anio": anio_val})
-                modelos = opciones(ses.soup, "main_ddlModelo")
-                
-                for modelo_val, modelo_nom in modelos:
-                    # Crear una clave única para identificar el "chunk" actual del vehículo
-                    chunk_key = f"{tipo_val}|{marca_val}|{anio_val}|{modelo_val}"
-                    if chunk_key in processed_keys:
-                        continue
+    try:
+        for tipo_val, tipo_nom in TIPOS.items():
+            ses.post("ctl00$main$ddlTipoAplicacion", {"tipo": tipo_val})
+            marcas = opciones(ses.soup, "main_ddlMarca")
 
-                    ses.post("ctl00$main$ddlModelo", {
-                        "tipo": tipo_val, "marca": marca_val, "anio": anio_val, "modelo": modelo_val
-                    })
-                    motores = opciones(ses.soup, "main_ddlCilindraje")
-                    
-                    for motor_val, motor_nom in motores:
-                        soup = ses.post("ctl00$main$ddlCilindraje", {
-                            "tipo": tipo_val, "marca": marca_val, "anio": anio_val, "modelo": modelo_val, "motor": motor_val
+            for marca_val, marca_nom in marcas:
+                ses.post("ctl00$main$ddlMarca", {"tipo": tipo_val, "marca": marca_val})
+                anios = opciones(ses.soup, "main_ddlAnio")
+
+                for anio_val, anio_nom in anios:
+                    ses.post("ctl00$main$ddlAnio", {"tipo": tipo_val, "marca": marca_val, "anio": anio_val})
+                    modelos = opciones(ses.soup, "main_ddlModelo")
+
+                    for modelo_val, modelo_nom in modelos:
+                        # Crear una clave única para identificar el "chunk" actual del vehículo
+                        chunk_key = f"{tipo_val}|{marca_val}|{anio_val}|{modelo_val}"
+                        if chunk_key in processed_keys:
+                            continue
+
+                        ses.post("ctl00$main$ddlModelo", {
+                            "tipo": tipo_val, "marca": marca_val, "anio": anio_val, "modelo": modelo_val
                         })
-                        
-                        for tipo_filtro, ref, img in filtros_de_resultado(soup):
-                            w_veh.writerow([tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref, img])
-                            print(f"[+] Match: {marca_nom} {modelo_nom} {anio_nom} {motor_nom} -> {ref}")
-                            
-                            if ref not in refs_detalladas:
-                                refs_detalladas.add(ref)
-                                for fila in detalle(ses.s, "Aplicaciones", ref):
-                                    w_apl.writerow([ref] + fila[:3])
-                                for fila in detalle(ses.s, "Equivalencias", ref):
-                                    w_equ.writerow([ref] + fila[:2])
-                    
-                    # Al finalizar por completo el modelo (un chunk lógico), guardamos progreso
-                    processed_keys.add(chunk_key)
-                    save_progress(processed_keys, refs_detalladas)
-                    f_veh.flush()
-                    f_apl.flush()
-                    f_equ.flush()
+                        motores = opciones(ses.soup, "main_ddlCilindraje")
 
-    for f in (f_veh, f_apl, f_equ):
-        f.close()
-    print("\n[✓] Extracción completada de manera segura.")
+                        for motor_val, motor_nom in motores:
+                            soup = ses.post("ctl00$main$ddlCilindraje", {
+                                "tipo": tipo_val, "marca": marca_val, "anio": anio_val, "modelo": modelo_val, "motor": motor_val
+                            })
+
+                            for tipo_filtro, ref, img in filtros_de_resultado(soup):
+                                key = (tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref)
+                                if key not in filas_existentes:
+                                    filas_existentes.add(key)
+                                    w_veh.writerow([tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref, img])
+                                    print(f"[+] Match: {marca_nom} {modelo_nom} {anio_nom} {motor_nom} -> {ref}")
+
+                                if ref not in refs_detalladas:
+                                    refs_detalladas.add(ref)
+                                    for fila in detalle(ses.s, "Aplicaciones", ref):
+                                        w_apl.writerow([ref] + fila[:3])
+                                    for fila in detalle(ses.s, "Equivalencias", ref):
+                                        w_equ.writerow([ref] + fila[:2])
+
+                        # Al finalizar por completo el modelo (un chunk lógico), guardamos progreso
+                        processed_keys.add(chunk_key)
+                        save_progress(processed_keys, refs_detalladas)
+                        f_veh.flush()
+                        f_apl.flush()
+                        f_equ.flush()
+
+                        if ses.should_checkpoint():
+                            if not pedir_confirmacion(f"\n[?] {ses.request_count} requests realizados. ¿Continuar? (Y/N): "):
+                                print("\n[i] Detenido en un punto seguro. Volvé a ejecutar el script para reanudar.")
+                                return
+                            ses.rotate_now()
+
+        print("\n[✓] Extracción completada de manera segura.")
+    except KeyboardInterrupt:
+        print("\n[i] Interrumpido por el usuario. El progreso guardado hasta el último modelo completado permite reanudar.")
+    finally:
+        for f in (f_veh, f_apl, f_equ):
+            f.close()
 
 if __name__ == "__main__":
     main()
