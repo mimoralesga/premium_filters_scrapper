@@ -7,6 +7,11 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 
+# Muchos IDEs bufferean el stdout del proceso hijo: sin esto, los print()
+# no aparecen hasta que el buffer se llena o el script termina, dando la
+# falsa impresión de que el scraper se colgó.
+sys.stdout.reconfigure(line_buffering=True)
+
 BASE = "https://automotriz.premiumfilters.com.co/"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
