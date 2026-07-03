@@ -45,6 +45,13 @@ def opciones(soup, el_id):
             out.append((val, op.get_text(strip=True)))
     return out
 
+LEVELS = [
+    ("ctl00$main$ddlTipoAplicacion", "tipo"),
+    ("ctl00$main$ddlMarca", "marca"),
+    ("ctl00$main$ddlAnio", "anio"),
+    ("ctl00$main$ddlModelo", "modelo"),
+]
+
 class RateLimitedSession:
     def __init__(self):
         self.request_count = 0
@@ -68,15 +75,7 @@ class RateLimitedSession:
                 print(f"\n[!] GET Error: {e}. Retrying in {RETRY_DELAY}s...")
             time.sleep(RETRY_DELAY)
 
-    def post(self, target, valores):
-        self.request_count += 1
-        if self.request_count >= SESSION_RENEW_EVERY:
-            print("\n[*] Rotating session to prevent session-based rate limits...")
-            self._init_session()
-            self.request_count = 0
-            # Re-apply current state step by step if needed, but usually 
-            # Viewstate controls the state dropdown tracking on .NET backend.
-        
+    def _post_raw(self, target, valores):
         data = campos_ocultos(self.soup)
         data.update({
             "__EVENTTARGET": target, "__EVENTARGUMENT": "",
@@ -92,12 +91,36 @@ class RateLimitedSession:
                 r = self.s.post(BASE, data=data, timeout=30)
                 if r.status_code == 200:
                     self.soup = BeautifulSoup(r.text, "html.parser")
-                    break
+                    return
                 print(f"\n[!] Status {r.status_code} on POST. Retrying in {RETRY_DELAY}s...")
             except Exception as e:
                 print(f"\n[!] POST Error: {e}. Retrying in {RETRY_DELAY}s...")
             time.sleep(RETRY_DELAY)
-            
+
+    def _replay_context(self, target, valores):
+        # Tras rotar la sesión, el __VIEWSTATE queda "en blanco". Hay que
+        # rehacer en orden las selecciones previas (tipo -> marca -> anio ->
+        # modelo) para que el servidor vuelva a considerar válidos los
+        # valores del postback actual, si no los combos quedan vacíos.
+        for level_target, key in LEVELS:
+            if level_target == target:
+                break
+            val = valores.get(key)
+            if not val or val == "-1":
+                continue
+            print(f"[*] Reconstruyendo estado: {key}={val}")
+            self._post_raw(level_target, valores)
+            sleep_jitter()
+
+    def post(self, target, valores):
+        self.request_count += 1
+        if self.request_count >= SESSION_RENEW_EVERY:
+            print("\n[*] Rotating session to prevent session-based rate limits...")
+            self._init_session()
+            self.request_count = 0
+            self._replay_context(target, valores)
+
+        self._post_raw(target, valores)
         sleep_jitter()
         return self.soup
 
