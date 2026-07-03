@@ -17,11 +17,18 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Configuraciones de throttling
-DELAY_MIN = 1.5
-DELAY_MAX = 3.5
-RETRY_DELAY = 15
-SESSION_RENEW_EVERY = 50  # Recrear la sesión cada 50 POSTs
+# Configuraciones de throttling. No hay proxy/IP rotativa disponible, así que
+# la única defensa real contra el rate limit es espaciar los requests y
+# reintentar con backoff, no "rotar" la sesión (eso no cambia la IP saliente).
+DELAY_MIN = 3.0
+DELAY_MAX = 6.0
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 30
+RETRY_BASE_DELAY = 5
+RETRY_MAX_DELAY = 180
+MAX_RETRIES = 8
+COOLDOWN_EVERY = 50    # Cada N requests, pausa larga automática (sin input)
+COOLDOWN_SECONDS = 120
 
 TIPOS = {"1": "Automoviles", "4": "Motocicletas"}
 PROGRESS_FILE = "scraping_progress.json"
@@ -29,14 +36,37 @@ PROGRESS_FILE = "scraping_progress.json"
 def sleep_jitter():
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-def pedir_confirmacion(mensaje):
-    while True:
-        resp = input(mensaje).strip().lower()
-        if resp in ("y", "yes", "s", "si", "sí"):
-            return True
-        if resp in ("n", "no"):
-            return False
-        print("[!] Respuesta no válida, escribí Y o N.")
+def _log(mensaje):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {mensaje}")
+
+def _parse_retry_after(header_value):
+    if not header_value:
+        return None
+    try:
+        return int(header_value)
+    except ValueError:
+        return None
+
+class ScraperFatalError(Exception):
+    pass
+
+def _get_with_retry(getter, describir):
+    # getter() debe devolver un objeto Response. Reintenta con backoff
+    # exponencial (o el Retry-After del servidor si lo manda) hasta
+    # MAX_RETRIES, y siempre deja rastro en consola de cuánto lleva esperando.
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = getter()
+            if r.status_code == 200:
+                return r
+            retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+            delay = retry_after if retry_after is not None else min(RETRY_BASE_DELAY * 2 ** (attempt - 1), RETRY_MAX_DELAY)
+            _log(f"[!] {describir}: status {r.status_code} (intento {attempt}/{MAX_RETRIES}). Esperando {delay:.0f}s...")
+        except Exception as e:
+            delay = min(RETRY_BASE_DELAY * 2 ** (attempt - 1), RETRY_MAX_DELAY)
+            _log(f"[!] {describir}: error {e} (intento {attempt}/{MAX_RETRIES}). Esperando {delay:.0f}s...")
+        time.sleep(delay)
+    raise ScraperFatalError(f"Se agotaron los {MAX_RETRIES} reintentos en: {describir}")
 
 def campos_ocultos(soup):
     def g(n):
@@ -59,17 +89,9 @@ def opciones(soup, el_id):
             out.append((val, op.get_text(strip=True)))
     return out
 
-LEVELS = [
-    ("ctl00$main$ddlTipoAplicacion", "tipo"),
-    ("ctl00$main$ddlMarca", "marca"),
-    ("ctl00$main$ddlAnio", "anio"),
-    ("ctl00$main$ddlModelo", "modelo"),
-]
-
 class RateLimitedSession:
     def __init__(self):
         self.request_count = 0
-        self.pending_replay = False
         self._init_session()
 
     def _init_session(self):
@@ -80,15 +102,11 @@ class RateLimitedSession:
         self.soup = self._safe_get(BASE)
 
     def _safe_get(self, url):
-        while True:
-            try:
-                r = self.s.get(url, timeout=30)
-                if r.status_code == 200:
-                    return BeautifulSoup(r.text, "html.parser")
-                print(f"\n[!] Status {r.status_code} on GET. Retrying in {RETRY_DELAY}s...")
-            except Exception as e:
-                print(f"\n[!] GET Error: {e}. Retrying in {RETRY_DELAY}s...")
-            time.sleep(RETRY_DELAY)
+        r = _get_with_retry(
+            lambda: self.s.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)),
+            f"GET {url}",
+        )
+        return BeautifulSoup(r.text, "html.parser")
 
     def _post_raw(self, target, valores):
         data = campos_ocultos(self.soup)
@@ -100,61 +118,37 @@ class RateLimitedSession:
             "ctl00$main$ddlModelo": valores.get("modelo", "-1"),
             "ctl00$main$ddlCilindraje": valores.get("motor", "-1"),
         })
+        r = _get_with_retry(
+            lambda: self.s.post(BASE, data=data, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)),
+            f"POST {target}",
+        )
+        self.soup = BeautifulSoup(r.text, "html.parser")
 
-        while True:
-            try:
-                r = self.s.post(BASE, data=data, timeout=30)
-                if r.status_code == 200:
-                    self.soup = BeautifulSoup(r.text, "html.parser")
-                    return
-                print(f"\n[!] Status {r.status_code} on POST. Retrying in {RETRY_DELAY}s...")
-            except Exception as e:
-                print(f"\n[!] POST Error: {e}. Retrying in {RETRY_DELAY}s...")
-            time.sleep(RETRY_DELAY)
-
-    def _replay_context(self, target, valores):
-        # Tras rotar la sesión, el __VIEWSTATE queda "en blanco". Hay que
-        # rehacer en orden las selecciones previas (tipo -> marca -> anio ->
-        # modelo) para que el servidor vuelva a considerar válidos los
-        # valores del postback actual, si no los combos quedan vacíos.
-        for level_target, key in LEVELS:
-            if level_target == target:
-                break
-            val = valores.get(key)
-            if not val or val == "-1":
-                continue
-            print(f"[*] Reconstruyendo estado: {key}={val}")
-            self._post_raw(level_target, valores)
-            sleep_jitter()
-
-    def should_checkpoint(self):
-        return self.request_count >= SESSION_RENEW_EVERY
-
-    def rotate_now(self):
-        self._init_session()
-        self.request_count = 0
-        self.pending_replay = True
+    def maybe_cooldown(self):
+        # Pausa larga automática cada COOLDOWN_EVERY requests, sin pedir
+        # confirmación. No se toca la sesión/cookies, así que el ViewState
+        # del servidor sigue siendo válido al reanudar.
+        if self.request_count >= COOLDOWN_EVERY:
+            _log(f"[i] {self.request_count} requests realizados. Pausa automática de {COOLDOWN_SECONDS}s...")
+            time.sleep(COOLDOWN_SECONDS)
+            _log("[i] Reanudando.")
+            self.request_count = 0
 
     def post(self, target, valores):
         self.request_count += 1
-        if self.pending_replay:
-            self._replay_context(target, valores)
-            self.pending_replay = False
-
         self._post_raw(target, valores)
         sleep_jitter()
+        self.maybe_cooldown()
         return self.soup
 
 def detalle(session, pagina, ref):
     url = f"{BASE}Emergentes/{pagina}.aspx?IdReferencia={ref}"
-    try:
-        r = session.get(url, timeout=30)
-        if r.status_code != 200:
-            return []
-        soup = BeautifulSoup(r.text, "html.parser")
-    except Exception:
-        return []
-    
+    r = _get_with_retry(
+        lambda: session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)),
+        f"GET detalle {pagina} {ref}",
+    )
+    soup = BeautifulSoup(r.text, "html.parser")
+
     filas = []
     for tr in soup.find_all("tr"):
         celdas = [td.get_text(strip=True) for td in tr.find_all("td")]
@@ -272,9 +266,9 @@ def main():
                                     w_veh.writerow([tipo_nom, marca_nom, anio_nom, modelo_nom, motor_nom, tipo_filtro, ref, img])
 
                                 if ref not in refs_detalladas:
-                                    refs_detalladas.add(ref)
                                     aplicaciones = detalle(ses.s, "Aplicaciones", ref)
                                     equivalencias = detalle(ses.s, "Equivalencias", ref)
+                                    refs_detalladas.add(ref)
                                     for fila in aplicaciones:
                                         w_apl.writerow([ref] + fila[:3])
                                     for fila in equivalencias:
@@ -293,15 +287,11 @@ def main():
                         f_apl.flush()
                         f_equ.flush()
 
-                        if ses.should_checkpoint():
-                            if not pedir_confirmacion(f"\n[?] {ses.request_count} requests realizados. ¿Continuar? (Y/N): "):
-                                print("\n[i] Detenido en un punto seguro. Volvé a ejecutar el script para reanudar.")
-                                return
-                            ses.rotate_now()
-
         print("\n[✓] Extracción completada de manera segura.")
     except KeyboardInterrupt:
         print("\n[i] Interrumpido por el usuario. El progreso guardado hasta el último modelo completado permite reanudar.")
+    except ScraperFatalError as e:
+        _log(f"[!] Fallo persistente tras {MAX_RETRIES} reintentos: {e}. Progreso guardado hasta el último modelo completado — volvé a ejecutar el script para reanudar.")
     finally:
         for f in (f_veh, f_apl, f_equ):
             f.close()
