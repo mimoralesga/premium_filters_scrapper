@@ -149,11 +149,16 @@ def detalle(session, pagina, ref):
     )
     soup = BeautifulSoup(r.text, "html.parser")
 
-    filas = []
+    filas, vistas = [], set()
     for tr in soup.find_all("tr"):
+        # El tr envoltorio de la tabla anidada concatena todo el texto de las
+        # filas internas en su td exterior; hay que saltarlo.
+        if tr.find("table"):
+            continue
         celdas = [td.get_text(strip=True) for td in tr.find_all("td")]
         celdas = [c for c in celdas if c]
-        if len(celdas) >= 2:
+        if len(celdas) >= 2 and tuple(celdas) not in vistas:
+            vistas.add(tuple(celdas))
             filas.append(celdas)
     sleep_jitter()
     return filas
